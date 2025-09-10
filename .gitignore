@@ -1,1 +1,19 @@
+# IDE/project local settings (not source code)
 .vscode
+
+# Build outputs and waves (created by scripts/Makefile)
+build/
+*.vcd
+*.vpd
+*.fsdb
+simv*
+csrc/
+.simvision/
+
+# Tool databases and logs
+.Xil/
+vivado.*
+work/
+*.jou
+*.str
+*.log
