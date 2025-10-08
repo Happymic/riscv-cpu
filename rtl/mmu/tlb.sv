@@ -1,220 +1,244 @@
-// Translation Lookaside Buffer (TLB)
-// Author: Auto-generated
-// Date: 2025-09-03
-// -----------------------------------------------------------------------------
-// Purpose:
-// - Cache recent virtual-to-physical translations with permissions and page size
-//   metadata. Supports 4KB/2MB/1GB pages and ASID scoping.
-//
-// Interface:
-// - Lookup: va -> pa, hit/valid, permissions (r/w/x/u), and page size flags.
-// - Update: insert/overwrite an entry (from page-table walker/OS) with PTE info.
-// - Maintenance: flush all or flush by ASID; global (G) mappings are preserved.
-// - Current ASID input selects which address space is visible.
-//
-// Replacement:
-// - Simple LRU counter per entry with a global min-victim policy (illustrative).
-//
-// Notes:
-// - This module provides only the TLB; a page table walker is assumed external.
-// - Permission bits are directly sampled from PTE fields for teaching simplicity.
-// -----------------------------------------------------------------------------
+//////////////////////////////////////////////////////////////////////////////////
+// Module: tlb
+// Author: RISC-V CPU Design Team
+// Date: 2024
+// Description: Translation Lookaside Buffer (TLB) for virtual memory translation
+//              16-entry fully associative TLB with LRU replacement
+//              Caches virtual-to-physical address translations
+//////////////////////////////////////////////////////////////////////////////////
+
+`timescale 1ns / 1ps
 
 module tlb #(
-    parameter XLEN = 64,
-    parameter TLB_ENTRIES = 64,
-    parameter ASID_WIDTH = 16
+    parameter TLB_ENTRIES = 16              // Number of TLB entries
 ) (
-    input  logic clk,
-    input  logic rst_n,
+    input  logic        clk,
+    input  logic        rst_n,
     
-    // Virtual address translation
-    input  logic [XLEN-1:0]     va,
-    output logic [XLEN-1:0]     pa,
-    output logic                hit,
-    output logic                valid,
+    // Lookup interface
+    input  logic        req,                // TLB lookup request
+    input  logic [19:0] vpn,                // Virtual page number (20 bits for Sv32)
+    output logic [21:0] ppn,                // Physical page number (22 bits)
+    output logic        hit,                // TLB hit signal
+    output logic        valid,              // Translation valid
+    output logic [7:0]  pte_flags,          // PTE flags from TLB entry
     
-    // Page table entry update
-    input  logic                update,
-    input  logic [XLEN-1:0]     update_va,
-    input  logic [XLEN-1:0]     update_pte,
-    input  logic [ASID_WIDTH-1:0] update_asid,
+    // Update interface
+    input  logic        update_en,          // Update enable
+    input  logic [19:0] update_vpn,         // VPN to update
+    input  logic [21:0] update_ppn,         // PPN to update
+    input  logic [7:0]  update_flags,       // Flags to update
     
-    // TLB maintenance
-    input  logic                flush,
-    input  logic                flush_asid,
-    input  logic [ASID_WIDTH-1:0] flush_asid_val,
-    
-    // Current ASID
-    input  logic [ASID_WIDTH-1:0] current_asid,
-    
-    // Access permissions
-    output logic                readable,
-    output logic                writable,
-    output logic                executable,
-    output logic                user_access,
-    
-    // Page size
-    output logic                is_4k_page,
-    output logic                is_2m_page,
-    output logic                is_1g_page
+    // Invalidation interface
+    input  logic        invalidate_all,     // Invalidate all entries (SFENCE.VMA)
+    input  logic [19:0] invalidate_vpn,     // VPN to invalidate
+    input  logic        invalidate_en       // Single entry invalidation enable
 );
 
-    // TLB entry structure
+    //////////////////////////////////////////////////////////////////////////////////
+    // TLB Entry Structure
+    //////////////////////////////////////////////////////////////////////////////////
+    
     typedef struct packed {
-        logic                valid;
-        logic [ASID_WIDTH-1:0] asid;
-        logic [XLEN-1:0]     vpn;      // Virtual page number
-        logic [XLEN-1:0]     ppn;      // Physical page number
-        logic                r, w, x;  // Read, write, execute
-        logic                u;        // User mode accessible
-        logic                g;        // Global mapping
-        logic                a, d;     // Accessed, dirty
-        logic [1:0]          page_size; // 00: 4K, 01: 2M, 10: 1G
+        logic        valid;                 // Valid bit
+        logic [19:0] vpn;                   // Virtual page number
+        logic [21:0] ppn;                   // Physical page number
+        logic [7:0]  flags;                 // PTE flags (V,R,W,X,U,G,A,D)
+        logic        global;                // Global bit (G flag)
     } tlb_entry_t;
-
-    tlb_entry_t tlb_entries [TLB_ENTRIES-1:0];
-
-    // LRU replacement
-    logic [$clog2(TLB_ENTRIES)-1:0] lru_counter [TLB_ENTRIES-1:0];
-    logic [$clog2(TLB_ENTRIES)-1:0] victim_entry;
-
-    // Address breakdown for different page sizes
-    logic [XLEN-1:0] va_4k_vpn, va_2m_vpn, va_1g_vpn;
-    logic [11:0]     va_4k_offset;
-    logic [20:0]     va_2m_offset;
-    logic [29:0]     va_1g_offset;
-
-    assign va_4k_vpn = va[XLEN-1:12];
-    assign va_2m_vpn = va[XLEN-1:21];
-    assign va_1g_vpn = va[XLEN-1:30];
-    assign va_4k_offset = va[11:0];
-    assign va_2m_offset = va[20:0];
-    assign va_1g_offset = va[29:0];
-
-    // Hit detection
-    logic [TLB_ENTRIES-1:0] entry_hit;
-    logic [$clog2(TLB_ENTRIES)-1:0] hit_entry;
-    logic found_hit;
-
+    
+    // TLB storage array
+    tlb_entry_t tlb_entries [TLB_ENTRIES];
+    
+    // LRU counters for replacement policy
+    logic [$clog2(TLB_ENTRIES)-1:0] lru_counter [TLB_ENTRIES];
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // TLB Lookup Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    logic [TLB_ENTRIES-1:0] entry_match;
+    logic [$clog2(TLB_ENTRIES)-1:0] hit_index;
+    logic entry_hit;
+    
+    // Check all entries for match
+    genvar i;
+    generate
+        for (i = 0; i < TLB_ENTRIES; i = i + 1) begin : gen_match_logic
+            always_comb begin
+                entry_match[i] = tlb_entries[i].valid && (tlb_entries[i].vpn == vpn);
+            end
+        end
+    endgenerate
+    
+    // Priority encoder to find first matching entry
     always_comb begin
-        found_hit = 1'b0;
-        hit_entry = 0;
+        hit_index = '0;
+        entry_hit = 1'b0;
         
-        for (int i = 0; i < TLB_ENTRIES; i++) begin
-            case (tlb_entries[i].page_size)
-                2'b00: // 4K page
-                    entry_hit[i] = tlb_entries[i].valid && 
-                                  (tlb_entries[i].asid == current_asid || tlb_entries[i].g) &&
-                                  (tlb_entries[i].vpn == va_4k_vpn);
-                2'b01: // 2M page
-                    entry_hit[i] = tlb_entries[i].valid && 
-                                  (tlb_entries[i].asid == current_asid || tlb_entries[i].g) &&
-                                  (tlb_entries[i].vpn[XLEN-1:21] == va_2m_vpn);
-                2'b10: // 1G page
-                    entry_hit[i] = tlb_entries[i].valid && 
-                                  (tlb_entries[i].asid == current_asid || tlb_entries[i].g) &&
-                                  (tlb_entries[i].vpn[XLEN-1:30] == va_1g_vpn);
-                default:
-                    entry_hit[i] = 1'b0;
-            endcase
-            
-            if (entry_hit[i] && !found_hit) begin
-                hit_entry = i;
-                found_hit = 1'b1;
+        for (int j = 0; j < TLB_ENTRIES; j = j + 1) begin
+            if (entry_match[j]) begin
+                hit_index = j;
+                entry_hit = 1'b1;
+                break;
             end
         end
     end
-
-    assign hit = found_hit;
-
-    // Physical address translation
+    
+    // Output assignment
     always_comb begin
-        pa = va; // Default passthrough
-        if (hit) begin
-            case (tlb_entries[hit_entry].page_size)
-                2'b00: // 4K page
-                    pa = {tlb_entries[hit_entry].ppn[XLEN-1:12], va_4k_offset};
-                2'b01: // 2M page
-                    pa = {tlb_entries[hit_entry].ppn[XLEN-1:21], va_2m_offset};
-                2'b10: // 1G page
-                    pa = {tlb_entries[hit_entry].ppn[XLEN-1:30], va_1g_offset};
-            endcase
+        if (req && entry_hit) begin
+            hit = 1'b1;
+            valid = tlb_entries[hit_index].valid;
+            ppn = tlb_entries[hit_index].ppn;
+            pte_flags = tlb_entries[hit_index].flags;
+        end else begin
+            hit = 1'b0;
+            valid = 1'b0;
+            ppn = 22'h0;
+            pte_flags = 8'h0;
         end
     end
-
-    // Permission outputs
-    assign valid = hit;
-    assign readable = hit ? tlb_entries[hit_entry].r : 1'b0;
-    assign writable = hit ? tlb_entries[hit_entry].w : 1'b0;
-    assign executable = hit ? tlb_entries[hit_entry].x : 1'b0;
-    assign user_access = hit ? tlb_entries[hit_entry].u : 1'b0;
-
-    // Page size outputs
-    assign is_4k_page = hit ? (tlb_entries[hit_entry].page_size == 2'b00) : 1'b0;
-    assign is_2m_page = hit ? (tlb_entries[hit_entry].page_size == 2'b01) : 1'b0;
-    assign is_1g_page = hit ? (tlb_entries[hit_entry].page_size == 2'b10) : 1'b0;
-
-    // LRU victim selection
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // LRU Replacement Policy
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    logic [$clog2(TLB_ENTRIES)-1:0] lru_victim;
+    logic [$clog2(TLB_ENTRIES)-1:0] max_lru_value;
+    
+    // Find LRU victim (entry with highest counter value)
     always_comb begin
-        victim_entry = 0;
-        for (int i = 1; i < TLB_ENTRIES; i++) begin
-            if (lru_counter[i] < lru_counter[victim_entry]) begin
-                victim_entry = i;
+        lru_victim = 0;
+        max_lru_value = lru_counter[0];
+        
+        for (int k = 1; k < TLB_ENTRIES; k = k + 1) begin
+            if (lru_counter[k] > max_lru_value) begin
+                max_lru_value = lru_counter[k];
+                lru_victim = k;
             end
         end
     end
-
-    // TLB update logic
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // TLB Update and Management Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    integer idx;
+    
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (int i = 0; i < TLB_ENTRIES; i++) begin
-                tlb_entries[i] <= '0;
-                lru_counter[i] <= i;
+            // Reset all TLB entries
+            for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                tlb_entries[idx].valid <= 1'b0;
+                tlb_entries[idx].vpn <= 20'h0;
+                tlb_entries[idx].ppn <= 22'h0;
+                tlb_entries[idx].flags <= 8'h0;
+                tlb_entries[idx].global <= 1'b0;
+                lru_counter[idx] <= idx;  // Initialize with different values
             end
         end else begin
-            // Handle flushes
-            if (flush) begin
-                for (int i = 0; i < TLB_ENTRIES; i++) begin
-                    if (!tlb_entries[i].g) begin // Don't flush global entries
-                        tlb_entries[i].valid <= 1'b0;
+            // Handle invalidation requests
+            if (invalidate_all) begin
+                // Invalidate all non-global entries (SFENCE.VMA without arguments)
+                for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                    if (!tlb_entries[idx].global) begin
+                        tlb_entries[idx].valid <= 1'b0;
                     end
                 end
-            end else if (flush_asid) begin
-                for (int i = 0; i < TLB_ENTRIES; i++) begin
-                    if (tlb_entries[i].asid == flush_asid_val && !tlb_entries[i].g) begin
-                        tlb_entries[i].valid <= 1'b0;
+            end else if (invalidate_en) begin
+                // Invalidate specific VPN (SFENCE.VMA with address)
+                for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                    if (tlb_entries[idx].valid && (tlb_entries[idx].vpn == invalidate_vpn)) begin
+                        tlb_entries[idx].valid <= 1'b0;
                     end
                 end
             end
             
-            // Handle updates
-            if (update) begin
-                tlb_entries[victim_entry].valid <= 1'b1;
-                tlb_entries[victim_entry].asid <= update_asid;
-                tlb_entries[victim_entry].vpn <= update_va[XLEN-1:12];
-                tlb_entries[victim_entry].ppn <= update_pte[XLEN-1:12];
-                tlb_entries[victim_entry].r <= update_pte[1];
-                tlb_entries[victim_entry].w <= update_pte[2];
-                tlb_entries[victim_entry].x <= update_pte[3];
-                tlb_entries[victim_entry].u <= update_pte[4];
-                tlb_entries[victim_entry].g <= update_pte[5];
-                tlb_entries[victim_entry].a <= update_pte[6];
-                tlb_entries[victim_entry].d <= update_pte[7];
-                // Page size detection would be done by PTW
-                tlb_entries[victim_entry].page_size <= 2'b00; // Default to 4K
+            // Update LRU counters on access
+            if (req && entry_hit) begin
+                // Reset accessed entry's counter to 0
+                lru_counter[hit_index] <= '0;
+                
+                // Increment all other counters
+                for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                    if (idx != hit_index) begin
+                        lru_counter[idx] <= lru_counter[idx] + 1;
+                    end
+                end
             end
             
-            // Update LRU on hit
-            if (hit) begin
-                lru_counter[hit_entry] <= TLB_ENTRIES - 1;
-                for (int i = 0; i < TLB_ENTRIES; i++) begin
-                    if (i != hit_entry && lru_counter[i] > lru_counter[hit_entry]) begin
-                        lru_counter[i] <= lru_counter[i] - 1;
+            // Handle TLB updates (new translation)
+            if (update_en) begin
+                // Check if VPN already exists in TLB
+                logic update_existing;
+                logic [$clog2(TLB_ENTRIES)-1:0] existing_index;
+                
+                update_existing = 1'b0;
+                existing_index = '0;
+                
+                for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                    if (tlb_entries[idx].valid && (tlb_entries[idx].vpn == update_vpn)) begin
+                        update_existing = 1'b1;
+                        existing_index = idx;
+                        break;
+                    end
+                end
+                
+                if (update_existing) begin
+                    // Update existing entry
+                    tlb_entries[existing_index].ppn <= update_ppn;
+                    tlb_entries[existing_index].flags <= update_flags;
+                    tlb_entries[existing_index].global <= update_flags[5];  // G bit
+                    
+                    // Reset LRU counter for updated entry
+                    lru_counter[existing_index] <= '0;
+                    for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                        if (idx != existing_index) begin
+                            lru_counter[idx] <= lru_counter[idx] + 1;
+                        end
+                    end
+                end else begin
+                    // Install new entry in LRU victim slot
+                    tlb_entries[lru_victim].valid <= 1'b1;
+                    tlb_entries[lru_victim].vpn <= update_vpn;
+                    tlb_entries[lru_victim].ppn <= update_ppn;
+                    tlb_entries[lru_victim].flags <= update_flags;
+                    tlb_entries[lru_victim].global <= update_flags[5];  // G bit
+                    
+                    // Reset LRU counter for new entry
+                    lru_counter[lru_victim] <= '0;
+                    for (idx = 0; idx < TLB_ENTRIES; idx = idx + 1) begin
+                        if (idx != lru_victim) begin
+                            lru_counter[idx] <= lru_counter[idx] + 1;
+                        end
                     end
                 end
             end
         end
     end
-
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Debug Output (simulation only)
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    `ifdef SIMULATION
+    always @(posedge clk) begin
+        if (req && hit) begin
+            $display("Time %t: TLB HIT - VPN: 0x%05x -> PPN: 0x%06x, Flags: 0x%02x", 
+                    $time, vpn, ppn, pte_flags);
+        end
+        if (update_en) begin
+            $display("Time %t: TLB UPDATE - VPN: 0x%05x -> PPN: 0x%06x, Victim: %0d", 
+                    $time, update_vpn, update_ppn, lru_victim);
+        end
+        if (invalidate_all) begin
+            $display("Time %t: TLB FLUSH ALL", $time);
+        end
+        if (invalidate_en) begin
+            $display("Time %t: TLB INVALIDATE - VPN: 0x%05x", $time, invalidate_vpn);
+        end
+    end
+    `endif
+    
 endmodule

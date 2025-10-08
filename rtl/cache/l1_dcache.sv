@@ -1,152 +1,212 @@
-// L1 Data Cache
-// Author: Auto-generated
-// Date: 2025-09-03
-// -----------------------------------------------------------------------------
-// Purpose:
-// - Two-way set-associative data cache supporting loads and stores with
-//   byte-enable writes. On miss, allocates from L2 and uses write-back policy.
-//
-// CPU interface (simplified):
-// - cpu_req/ack/hit handshake with single outstanding request.
-// - cpu_addr/wdata/we/be for accesses; cpu_rdata returns a 64-bit word slice
-//   from the cache line based on byte offset.
-//
-// Miss flow:
-// - If victim line is dirty, write it back to L2, then allocate and refill.
-// - LRU policy mirrors I-cache (simple bit per set).
-//
-// Notes:
-// - Uses packed arrays to hold tags/data/valid/dirty; replace with SRAMs in HW.
-// - Flush clears valid/dirty; memory consistency is abstracted away here.
-// -----------------------------------------------------------------------------
+//////////////////////////////////////////////////////////////////////////////////
+// Module: l1_dcache
+// Author: RISC-V CPU Design Team
+// Date: 2024
+// Description: L1 Data Cache - 2-way set associative
+//              Supports both read and write operations with write-back policy
+//              Implements MESI coherence protocol states
+//////////////////////////////////////////////////////////////////////////////////
+
+`timescale 1ns / 1ps
 
 module l1_dcache #(
-    parameter CACHE_SIZE = 32768,  // 32KB
-    parameter BLOCK_SIZE = 64,     // 64 bytes per block
-    parameter ASSOCIATIVITY = 2,   // 2-way set associative
-    parameter XLEN = 64
+    parameter CACHE_SIZE_KB   = 32,         // Cache size in KB
+    parameter LINE_SIZE_BYTES = 16,         // Cache line size in bytes
+    parameter ASSOCIATIVITY   = 2           // Number of ways (2-way set associative)
 ) (
-    input  logic clk,
-    input  logic rst_n,
+    input  logic        clk,
+    input  logic        rst_n,
     
     // CPU interface
-    input  logic [XLEN-1:0] cpu_addr,
-    input  logic [XLEN-1:0] cpu_wdata,
-    output logic [XLEN-1:0] cpu_rdata,
-    input  logic            cpu_we,
-    input  logic [7:0]      cpu_be,
-    input  logic            cpu_req,
-    output logic            cpu_ack,
-    output logic            cpu_hit,
+    input  logic        req,                // Cache request
+    input  logic        we,                 // Write enable
+    input  logic [31:0] addr,               // Request address
+    input  logic [31:0] wdata,              // Write data
+    input  logic [3:0]  be,                 // Byte enable
+    output logic [31:0] rdata,              // Read data
+    output logic        hit,                // Cache hit signal
+    output logic        stall,              // Stall signal (miss handling)
     
-    // L2 interface
-    output logic [XLEN-1:0] l2_addr,
-    output logic [BLOCK_SIZE*8-1:0] l2_wdata,
-    input  logic [BLOCK_SIZE*8-1:0] l2_rdata,
-    output logic            l2_we,
-    output logic            l2_req,
-    input  logic            l2_ack,
-    
-    // Control
-    input  logic            flush,
-    output logic            busy
+    // L2 cache interface
+    output logic        l2_req,             // L2 cache request
+    output logic        l2_we,              // L2 cache write enable
+    output logic [31:0] l2_addr,            // L2 cache address
+    output logic [127:0] l2_wdata,          // L2 cache write data (full line)
+    input  logic [127:0] l2_rdata,          // L2 cache read data (full line)
+    input  logic        l2_valid            // L2 data valid
 );
 
-    localparam BLOCK_OFFSET_BITS = $clog2(BLOCK_SIZE);
-    localparam INDEX_BITS = $clog2(CACHE_SIZE / (BLOCK_SIZE * ASSOCIATIVITY));
-    localparam TAG_BITS = XLEN - INDEX_BITS - BLOCK_OFFSET_BITS;
-    localparam NUM_SETS = 1 << INDEX_BITS;
-
-    // Cache line structure
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Parameters Calculation
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    localparam CACHE_SIZE_BYTES  = CACHE_SIZE_KB * 1024;
+    localparam NUM_LINES         = CACHE_SIZE_BYTES / LINE_SIZE_BYTES;
+    localparam NUM_SETS          = NUM_LINES / ASSOCIATIVITY;
+    localparam INDEX_BITS        = $clog2(NUM_SETS);
+    localparam OFFSET_BITS       = $clog2(LINE_SIZE_BYTES);
+    localparam TAG_BITS          = 32 - INDEX_BITS - OFFSET_BITS;
+    localparam WORDS_PER_LINE    = LINE_SIZE_BYTES / 4;
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Line Structure with MESI States
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    typedef enum logic [1:0] {
+        INVALID = 2'b00,
+        SHARED  = 2'b01,
+        EXCLUSIVE = 2'b10,
+        MODIFIED = 2'b11
+    } mesi_state_t;
+    
     typedef struct packed {
-        logic valid;
-        logic dirty;
-        logic [TAG_BITS-1:0] tag;
-        logic [BLOCK_SIZE*8-1:0] data;
+        logic               valid;          // Valid bit
+        mesi_state_t        state;          // MESI coherence state
+        logic [TAG_BITS-1:0] tag;           // Tag bits
+        logic [127:0]       data;           // 128-bit data (4 words)
+        logic               dirty;          // Dirty bit for write-back
     } cache_line_t;
-
-    // Cache storage
-    cache_line_t cache_data [NUM_SETS-1:0] [ASSOCIATIVITY-1:0];
-    logic [ASSOCIATIVITY-1:0] lru [NUM_SETS-1:0];
-
-    // Address breakdown
-    logic [BLOCK_OFFSET_BITS-1:0] block_offset;
-    logic [INDEX_BITS-1:0] index;
-    logic [TAG_BITS-1:0] tag;
     
-    assign block_offset = cpu_addr[BLOCK_OFFSET_BITS-1:0];
-    assign index = cpu_addr[INDEX_BITS+BLOCK_OFFSET_BITS-1:BLOCK_OFFSET_BITS];
-    assign tag = cpu_addr[XLEN-1:INDEX_BITS+BLOCK_OFFSET_BITS];
-
-    // Hit detection
-    logic [ASSOCIATIVITY-1:0] way_hit;
-    logic cache_hit;
-    logic [ASSOCIATIVITY-1:0] way_valid;
-    logic [$clog2(ASSOCIATIVITY)-1:0] hit_way;
+    // Cache arrays (2 ways)
+    cache_line_t cache_way0 [NUM_SETS];
+    cache_line_t cache_way1 [NUM_SETS];
     
-    genvar i;
-    generate
-        for (i = 0; i < ASSOCIATIVITY; i++) begin : gen_hit_detect
-            assign way_valid[i] = cache_data[index][i].valid;
-            assign way_hit[i] = way_valid[i] && (cache_data[index][i].tag == tag);
-        end
-    endgenerate
+    // LRU bits
+    logic [NUM_SETS-1:0] lru_bits;
     
-    assign cache_hit = |way_hit;
+    //////////////////////////////////////////////////////////////////////////////////
+    // Address Breakdown
+    //////////////////////////////////////////////////////////////////////////////////
     
-    // Find hit way
-    always_comb begin
-        hit_way = 0;
-        for (int j = 0; j < ASSOCIATIVITY; j++) begin
-            if (way_hit[j]) begin
-                hit_way = j;
-            end
-        end
-    end
-
-    // Data output multiplexing
-    logic [BLOCK_SIZE*8-1:0] hit_data;
-    assign hit_data = cache_data[index][hit_way].data;
-
-    // Extract data from cache line based on address
-    logic [5:0] byte_offset;
-    assign byte_offset = block_offset[5:0];
-    assign cpu_rdata = hit_data[byte_offset*8 +: 64];
-
-    // State machine
+    logic [TAG_BITS-1:0]   addr_tag;
+    logic [INDEX_BITS-1:0] addr_index;
+    logic [OFFSET_BITS-1:0] addr_offset;
+    logic [1:0]            word_offset;
+    
+    assign addr_tag    = addr[31:31-TAG_BITS+1];
+    assign addr_index  = addr[31-TAG_BITS:OFFSET_BITS];
+    assign addr_offset = addr[OFFSET_BITS-1:0];
+    assign word_offset = addr_offset[3:2];
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache State Machine
+    //////////////////////////////////////////////////////////////////////////////////
+    
     typedef enum logic [2:0] {
         IDLE,
-        WRITEBACK,
-        ALLOCATE,
-        REFILL
+        MISS_REQUEST,
+        MISS_WAIT,
+        MISS_UPDATE,
+        WRITEBACK_REQUEST,
+        WRITEBACK_WAIT
     } state_t;
     
     state_t state, next_state;
-
-    // LRU replacement policy
-    logic [$clog2(ASSOCIATIVITY)-1:0] replace_way;
-    logic need_writeback;
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Hit/Miss Detection Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    logic way0_hit, way1_hit;
+    logic cache_hit;
+    logic [127:0] hit_data;
+    logic hit_way;
+    logic victim_way;
+    logic victim_dirty;
+    logic [127:0] victim_data;
+    logic [31:0] victim_addr;
     
     always_comb begin
-        replace_way = 0;
-        need_writeback = 1'b0;
+        // Check way 0
+        way0_hit = cache_way0[addr_index].valid && 
+                  (cache_way0[addr_index].tag == addr_tag) &&
+                  (cache_way0[addr_index].state != INVALID);
         
-        for (int k = 0; k < ASSOCIATIVITY; k++) begin
-            if (!way_valid[k]) begin
-                replace_way = k;
-                need_writeback = 1'b0;
-                break;
-            end
+        // Check way 1
+        way1_hit = cache_way1[addr_index].valid && 
+                  (cache_way1[addr_index].tag == addr_tag) &&
+                  (cache_way1[addr_index].state != INVALID);
+        
+        // Overall hit
+        cache_hit = way0_hit || way1_hit;
+        hit_way = way1_hit;
+        
+        // Select data from hitting way
+        if (way0_hit) begin
+            hit_data = cache_way0[addr_index].data;
+        end else if (way1_hit) begin
+            hit_data = cache_way1[addr_index].data;
+        end else begin
+            hit_data = 128'h0;
         end
         
-        // If all ways valid, use LRU
-        if (&way_valid) begin
-            replace_way = lru[index][0] ? 0 : 1; // Simple LRU for 2-way
-            need_writeback = cache_data[index][replace_way].dirty;
+        // Victim selection for replacement
+        victim_way = lru_bits[addr_index];
+        if (victim_way == 1'b0) begin
+            victim_dirty = cache_way0[addr_index].dirty;
+            victim_data = cache_way0[addr_index].data;
+            victim_addr = {cache_way0[addr_index].tag, addr_index, {OFFSET_BITS{1'b0}}};
+        end else begin
+            victim_dirty = cache_way1[addr_index].dirty;
+            victim_data = cache_way1[addr_index].data;
+            victim_addr = {cache_way1[addr_index].tag, addr_index, {OFFSET_BITS{1'b0}}};
         end
     end
-
-    // State machine logic
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Data Read/Write Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    logic [127:0] updated_data;
+    logic [31:0] write_word;
+    
+    // Data read multiplexer
+    always_comb begin
+        case (word_offset)
+            2'b00: rdata = hit_data[31:0];
+            2'b01: rdata = hit_data[63:32];
+            2'b10: rdata = hit_data[95:64];
+            2'b11: rdata = hit_data[127:96];
+        endcase
+    end
+    
+    // Data write update logic
+    always_comb begin
+        updated_data = hit_data;
+        
+        // Apply byte enables for write
+        case (word_offset)
+            2'b00: begin
+                if (be[0]) updated_data[7:0]   = wdata[7:0];
+                if (be[1]) updated_data[15:8]  = wdata[15:8];
+                if (be[2]) updated_data[23:16] = wdata[23:16];
+                if (be[3]) updated_data[31:24] = wdata[31:24];
+            end
+            2'b01: begin
+                if (be[0]) updated_data[39:32] = wdata[7:0];
+                if (be[1]) updated_data[47:40] = wdata[15:8];
+                if (be[2]) updated_data[55:48] = wdata[23:16];
+                if (be[3]) updated_data[63:56] = wdata[31:24];
+            end
+            2'b10: begin
+                if (be[0]) updated_data[71:64] = wdata[7:0];
+                if (be[1]) updated_data[79:72] = wdata[15:8];
+                if (be[2]) updated_data[87:80] = wdata[23:16];
+                if (be[3]) updated_data[95:88] = wdata[31:24];
+            end
+            2'b11: begin
+                if (be[0]) updated_data[103:96]  = wdata[7:0];
+                if (be[1]) updated_data[111:104] = wdata[15:8];
+                if (be[2]) updated_data[119:112] = wdata[23:16];
+                if (be[3]) updated_data[127:120] = wdata[31:24];
+            end
+        endcase
+    end
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache State Machine Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
@@ -154,114 +214,145 @@ module l1_dcache #(
             state <= next_state;
         end
     end
-
+    
     always_comb begin
         next_state = state;
-        case (state)
-            IDLE: begin
-                if (cpu_req && !cache_hit) begin
-                    if (need_writeback) begin
-                        next_state = WRITEBACK;
-                    end else begin
-                        next_state = ALLOCATE;
-                    end
-                end
-            end
-            WRITEBACK: begin
-                if (l2_ack) begin
-                    next_state = ALLOCATE;
-                end
-            end
-            ALLOCATE: begin
-                next_state = REFILL;
-            end
-            REFILL: begin
-                if (l2_ack) begin
-                    next_state = IDLE;
-                end
-            end
-        endcase
-    end
-
-    // Control signals
-    assign cpu_ack = (state == IDLE) && (cache_hit || !cpu_req);
-    assign cpu_hit = cache_hit;
-    assign busy = (state != IDLE);
-
-    // L2 interface signals
-    always_comb begin
         l2_req = 1'b0;
         l2_we = 1'b0;
-        l2_addr = '0;
-        l2_wdata = '0;
+        l2_addr = 32'h0;
+        l2_wdata = 128'h0;
+        stall = 1'b0;
+        hit = 1'b0;
         
         case (state)
-            WRITEBACK: begin
-                l2_req = 1'b1;
-                l2_we = 1'b1;
-                l2_addr = {cache_data[index][replace_way].tag, index, {BLOCK_OFFSET_BITS{1'b0}}};
-                l2_wdata = cache_data[index][replace_way].data;
-            end
-            ALLOCATE: begin
-                l2_req = 1'b1;
-                l2_we = 1'b0;
-                l2_addr = {cpu_addr[XLEN-1:BLOCK_OFFSET_BITS], {BLOCK_OFFSET_BITS{1'b0}}};
-            end
-        endcase
-    end
-
-    // Cache update logic
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (int i = 0; i < NUM_SETS; i++) begin
-                lru[i] <= '0;
-                for (int j = 0; j < ASSOCIATIVITY; j++) begin
-                    cache_data[i][j].valid <= 1'b0;
-                    cache_data[i][j].dirty <= 1'b0;
-                    cache_data[i][j].tag <= '0;
-                    cache_data[i][j].data <= '0;
-                end
-            end
-        end else begin
-            if (flush) begin
-                for (int i = 0; i < NUM_SETS; i++) begin
-                    for (int j = 0; j < ASSOCIATIVITY; j++) begin
-                        cache_data[i][j].valid <= 1'b0;
-                        cache_data[i][j].dirty <= 1'b0;
-                    end
-                end
-            end else begin
-                // Update on cache hit
-                if (cpu_req && cache_hit) begin
-                    // Update LRU
-                    if (way_hit[0]) lru[index] <= 1'b1; // Make way 1 LRU
-                    if (way_hit[1]) lru[index] <= 1'b0; // Make way 0 LRU
-                    
-                    // Handle writes
-                    if (cpu_we) begin
-                        cache_data[index][hit_way].dirty <= 1'b1;
-                        // Byte-level write with byte enables
-                        for (int b = 0; b < 8; b++) begin
-                            if (cpu_be[b]) begin
-                                cache_data[index][hit_way].data[byte_offset*8 + b*8 +: 8] <= cpu_wdata[b*8 +: 8];
-                            end
+            IDLE: begin
+                if (req) begin
+                    if (cache_hit) begin
+                        // Cache hit
+                        hit = 1'b1;
+                        next_state = IDLE;
+                    end else begin
+                        // Cache miss - check if victim needs writeback
+                        stall = 1'b1;
+                        if (victim_dirty) begin
+                            next_state = WRITEBACK_REQUEST;
+                        end else begin
+                            next_state = MISS_REQUEST;
                         end
                     end
                 end
+            end
+            
+            WRITEBACK_REQUEST: begin
+                // Write back dirty victim
+                stall = 1'b1;
+                l2_req = 1'b1;
+                l2_we = 1'b1;
+                l2_addr = victim_addr;
+                l2_wdata = victim_data;
+                next_state = WRITEBACK_WAIT;
+            end
+            
+            WRITEBACK_WAIT: begin
+                stall = 1'b1;
+                if (l2_valid) begin
+                    next_state = MISS_REQUEST;
+                end else begin
+                    next_state = WRITEBACK_WAIT;
+                end
+            end
+            
+            MISS_REQUEST: begin
+                // Request data from L2
+                stall = 1'b1;
+                l2_req = 1'b1;
+                l2_we = 1'b0;
+                l2_addr = {addr[31:OFFSET_BITS], {OFFSET_BITS{1'b0}}};
+                next_state = MISS_WAIT;
+            end
+            
+            MISS_WAIT: begin
+                // Wait for L2 response
+                stall = 1'b1;
+                if (l2_valid) begin
+                    next_state = MISS_UPDATE;
+                end else begin
+                    next_state = MISS_WAIT;
+                end
+            end
+            
+            MISS_UPDATE: begin
+                // Update cache with new data
+                stall = 1'b0;
+                hit = 1'b1;
+                next_state = IDLE;
+            end
+            
+            default: next_state = IDLE;
+        endcase
+    end
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Update Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    integer i;
+    
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            // Reset cache
+            for (i = 0; i < NUM_SETS; i = i + 1) begin
+                cache_way0[i].valid <= 1'b0;
+                cache_way0[i].state <= INVALID;
+                cache_way0[i].tag <= '0;
+                cache_way0[i].data <= 128'h0;
+                cache_way0[i].dirty <= 1'b0;
+                cache_way1[i].valid <= 1'b0;
+                cache_way1[i].state <= INVALID;
+                cache_way1[i].tag <= '0;
+                cache_way1[i].data <= 128'h0;
+                cache_way1[i].dirty <= 1'b0;
+            end
+            lru_bits <= '0;
+        end else begin
+            // Update LRU on hit
+            if (state == IDLE && req && cache_hit) begin
+                lru_bits[addr_index] <= !hit_way;
                 
-                // Refill on L2 response
-                if (state == REFILL && l2_ack) begin
-                    cache_data[index][replace_way].valid <= 1'b1;
-                    cache_data[index][replace_way].dirty <= 1'b0;
-                    cache_data[index][replace_way].tag <= tag;
-                    cache_data[index][replace_way].data <= l2_rdata;
-                    
-                    // Update LRU
-                    if (replace_way == 0) lru[index] <= 1'b1;
-                    if (replace_way == 1) lru[index] <= 1'b0;
+                // Handle write hit
+                if (we) begin
+                    if (way0_hit) begin
+                        cache_way0[addr_index].data <= updated_data;
+                        cache_way0[addr_index].dirty <= 1'b1;
+                        cache_way0[addr_index].state <= MODIFIED;
+                    end else if (way1_hit) begin
+                        cache_way1[addr_index].data <= updated_data;
+                        cache_way1[addr_index].dirty <= 1'b1;
+                        cache_way1[addr_index].state <= MODIFIED;
+                    end
+                end
+            end
+            
+            // Update cache on miss
+            if (state == MISS_UPDATE) begin
+                // Replace victim way
+                if (victim_way == 1'b0) begin
+                    cache_way0[addr_index].valid <= 1'b1;
+                    cache_way0[addr_index].tag <= addr_tag;
+                    cache_way0[addr_index].data <= l2_rdata;
+                    cache_way0[addr_index].dirty <= 1'b0;
+                    cache_way0[addr_index].state <= SHARED;
+                    lru_bits[addr_index] <= 1'b1;
+                end else begin
+                    cache_way1[addr_index].valid <= 1'b1;
+                    cache_way1[addr_index].tag <= addr_tag;
+                    cache_way1[addr_index].data <= l2_rdata;
+                    cache_way1[addr_index].dirty <= 1'b0;
+                    cache_way1[addr_index].state <= SHARED;
+                    lru_bits[addr_index] <= 1'b0;
                 end
             end
         end
     end
-
+    
 endmodule

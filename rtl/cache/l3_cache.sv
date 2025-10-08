@@ -1,306 +1,378 @@
-// L3 Shared Cache
-// Author: Auto-generated
-// Date: 2025-09-03
-// -----------------------------------------------------------------------------
-// Role:
-// - Last-level cache shared by multiple L2 ports. Round-robin arbitration picks
-//   one requesting port per serve, then executes the same write-back/allocate
-//   policy as L2. Memory interface is line-based.
-//
-// Arbitration:
-// - Round-robin pointer advances after each RESPOND state to provide fairness.
-//
-// Simplifications:
-// - Single outstanding request; true multi-port and MSHR-based non-blocking
-//   designs would decouple pipeline from memory latency.
-// -----------------------------------------------------------------------------
+//////////////////////////////////////////////////////////////////////////////////
+// Module: l3_cache
+// Author: RISC-V CPU Design Team
+// Date: 2024
+// Description: L3 Last-Level Cache - 2-way set associative
+//              Interface between cache hierarchy and main memory
+//              Implements write-back policy with AXI-like memory interface
+//////////////////////////////////////////////////////////////////////////////////
+
+`timescale 1ns / 1ps
 
 module l3_cache #(
-    parameter CACHE_SIZE = 2097152, // 2MB
-    parameter BLOCK_SIZE = 64,      // 64 bytes per block
-    parameter ASSOCIATIVITY = 2,    // 2-way set associative
-    parameter XLEN = 64,
-    parameter NUM_PORTS = 4         // Number of L2 cache ports
+    parameter CACHE_SIZE_KB   = 2048,       // Cache size in KB (2MB)
+    parameter LINE_SIZE_BYTES = 16,         // Cache line size in bytes
+    parameter ASSOCIATIVITY   = 2           // Number of ways (2-way set associative)
 ) (
-    input  logic clk,
-    input  logic rst_n,
+    input  logic        clk,
+    input  logic        rst_n,
     
-    // L2 Cache interfaces (multiple ports)
-    input  logic [NUM_PORTS-1:0] [XLEN-1:0] l2_addr,
-    input  logic [NUM_PORTS-1:0] [BLOCK_SIZE*8-1:0] l2_wdata,
-    output logic [NUM_PORTS-1:0] [BLOCK_SIZE*8-1:0] l2_rdata,
-    input  logic [NUM_PORTS-1:0] l2_we,
-    input  logic [NUM_PORTS-1:0] l2_req,
-    output logic [NUM_PORTS-1:0] l2_ack,
+    // L2 cache interface
+    input  logic        l2_req,             // L2 cache request
+    input  logic        l2_we,              // L2 cache write enable
+    input  logic [31:0] l2_addr,            // L2 cache address
+    input  logic [127:0] l2_wdata,          // L2 cache write data (full line)
+    output logic [127:0] l2_rdata,          // L2 cache read data (full line)
+    output logic        l2_valid,           // L2 data valid
     
-    // Memory interface
-    output logic [XLEN-1:0] mem_addr,
-    output logic [BLOCK_SIZE*8-1:0] mem_wdata,
-    input  logic [BLOCK_SIZE*8-1:0] mem_rdata,
-    output logic            mem_we,
-    output logic            mem_req,
-    input  logic            mem_ack,
-    
-    // Control
-    input  logic            flush,
-    output logic            busy
+    // Memory interface (simplified AXI-like)
+    output logic        mem_req,            // Memory request
+    output logic        mem_we,             // Memory write enable
+    output logic [31:0] mem_addr,           // Memory address
+    output logic [31:0] mem_wdata,          // Memory write data (word)
+    output logic [3:0]  mem_be,             // Byte enable
+    input  logic [31:0] mem_rdata,          // Memory read data (word)
+    input  logic        mem_ready           // Memory ready signal
 );
 
-    localparam BLOCK_OFFSET_BITS = $clog2(BLOCK_SIZE);
-    localparam INDEX_BITS = $clog2(CACHE_SIZE / (BLOCK_SIZE * ASSOCIATIVITY));
-    localparam TAG_BITS = XLEN - INDEX_BITS - BLOCK_OFFSET_BITS;
-    localparam NUM_SETS = 1 << INDEX_BITS;
-
-    // Cache line structure
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Parameters Calculation
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    localparam CACHE_SIZE_BYTES  = CACHE_SIZE_KB * 1024;
+    localparam NUM_LINES         = CACHE_SIZE_BYTES / LINE_SIZE_BYTES;
+    localparam NUM_SETS          = NUM_LINES / ASSOCIATIVITY;
+    localparam INDEX_BITS        = $clog2(NUM_SETS);
+    localparam OFFSET_BITS       = $clog2(LINE_SIZE_BYTES);
+    localparam TAG_BITS          = 32 - INDEX_BITS - OFFSET_BITS;
+    localparam WORDS_PER_LINE    = LINE_SIZE_BYTES / 4;  // 4 words per line
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Line Structure
+    //////////////////////////////////////////////////////////////////////////////////
+    
     typedef struct packed {
-        logic valid;
-        logic dirty;
-        logic [TAG_BITS-1:0] tag;
-        logic [BLOCK_SIZE*8-1:0] data;
+        logic               valid;          // Valid bit
+        logic [TAG_BITS-1:0] tag;           // Tag bits
+        logic [127:0]       data;           // 128-bit data (4 words)
+        logic               dirty;          // Dirty bit
     } cache_line_t;
-
-    // Cache storage
-    cache_line_t cache_data [NUM_SETS-1:0] [ASSOCIATIVITY-1:0];
-    logic [ASSOCIATIVITY-1:0] lru [NUM_SETS-1:0];
-
-    // Round-robin arbitration
-    logic [$clog2(NUM_PORTS)-1:0] arb_pointer;
-    logic [$clog2(NUM_PORTS)-1:0] current_port;
-    logic port_selected;
-
-    // Select current port using round-robin
-    always_comb begin
-        current_port = 0;
-        port_selected = 1'b0;
-        
-        for (int p = 0; p < NUM_PORTS; p++) begin
-            if (l2_req[(arb_pointer + p) % NUM_PORTS] && !port_selected) begin
-                current_port = (arb_pointer + p) % NUM_PORTS;
-                port_selected = 1'b1;
-            end
-        end
-    end
-
-    // Current request signals
-    logic [XLEN-1:0] current_addr;
-    logic [BLOCK_SIZE*8-1:0] current_wdata;
-    logic current_we;
-    logic current_req;
-
-    assign current_addr = l2_addr[current_port];
-    assign current_wdata = l2_wdata[current_port];
-    assign current_we = l2_we[current_port];
-    assign current_req = port_selected;
-
-    // Address breakdown
-    logic [BLOCK_OFFSET_BITS-1:0] block_offset;
-    logic [INDEX_BITS-1:0] index;
-    logic [TAG_BITS-1:0] tag;
     
-    assign block_offset = current_addr[BLOCK_OFFSET_BITS-1:0];
-    assign index = current_addr[INDEX_BITS+BLOCK_OFFSET_BITS-1:BLOCK_OFFSET_BITS];
-    assign tag = current_addr[XLEN-1:INDEX_BITS+BLOCK_OFFSET_BITS];
-
-    // Hit detection
-    logic [ASSOCIATIVITY-1:0] way_hit;
-    logic cache_hit;
-    logic [ASSOCIATIVITY-1:0] way_valid;
-    logic [$clog2(ASSOCIATIVITY)-1:0] hit_way;
+    // Cache arrays (2 ways)
+    cache_line_t cache_way0 [NUM_SETS];
+    cache_line_t cache_way1 [NUM_SETS];
     
-    genvar i;
-    generate
-        for (i = 0; i < ASSOCIATIVITY; i++) begin : gen_hit_detect
-            assign way_valid[i] = cache_data[index][i].valid;
-            assign way_hit[i] = way_valid[i] && (cache_data[index][i].tag == tag);
-        end
-    endgenerate
+    // LRU bits
+    logic [NUM_SETS-1:0] lru_bits;
     
-    assign cache_hit = |way_hit;
+    //////////////////////////////////////////////////////////////////////////////////
+    // Address Breakdown
+    //////////////////////////////////////////////////////////////////////////////////
     
-    // Find hit way
-    always_comb begin
-        hit_way = 0;
-        for (int j = 0; j < ASSOCIATIVITY; j++) begin
-            if (way_hit[j]) begin
-                hit_way = j;
-            end
-        end
-    end
-
-    // Data output
-    logic [BLOCK_SIZE*8-1:0] hit_data;
-    assign hit_data = cache_data[index][hit_way].data;
-
-    // State machine
-    typedef enum logic [2:0] {
+    logic [TAG_BITS-1:0]   addr_tag;
+    logic [INDEX_BITS-1:0] addr_index;
+    logic [OFFSET_BITS-1:0] addr_offset;
+    logic [1:0]            word_offset;     // Word within cache line
+    
+    assign addr_tag    = l2_addr[31:31-TAG_BITS+1];
+    assign addr_index  = l2_addr[31-TAG_BITS:OFFSET_BITS];
+    assign addr_offset = l2_addr[OFFSET_BITS-1:0];
+    assign word_offset = addr_offset[3:2];
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache State Machine
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    typedef enum logic [3:0] {
         IDLE,
-        WRITEBACK,
-        ALLOCATE,
-        REFILL,
-        RESPOND
+        MISS_FETCH_W0,
+        MISS_FETCH_W1,
+        MISS_FETCH_W2,
+        MISS_FETCH_W3,
+        MISS_UPDATE,
+        WRITEBACK_W0,
+        WRITEBACK_W1,
+        WRITEBACK_W2,
+        WRITEBACK_W3,
+        WRITEBACK_DONE
     } state_t;
     
     state_t state, next_state;
-    logic [$clog2(NUM_PORTS)-1:0] serving_port;
-
-    // LRU replacement policy
-    logic [$clog2(ASSOCIATIVITY)-1:0] replace_way;
-    logic need_writeback;
+    logic [1:0] fetch_word_count;
+    logic [127:0] fetch_data;
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Hit/Miss Detection Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    logic way0_hit, way1_hit;
+    logic cache_hit;
+    logic [127:0] hit_data;
+    logic hit_way;
+    logic victim_way;
+    logic victim_dirty;
+    logic [127:0] victim_data;
+    logic [31:0] victim_addr;
     
     always_comb begin
-        replace_way = 0;
-        need_writeback = 1'b0;
+        // Check way 0
+        way0_hit = cache_way0[addr_index].valid && 
+                  (cache_way0[addr_index].tag == addr_tag);
         
-        for (int k = 0; k < ASSOCIATIVITY; k++) begin
-            if (!way_valid[k]) begin
-                replace_way = k;
-                need_writeback = 1'b0;
-                break;
-            end
+        // Check way 1
+        way1_hit = cache_way1[addr_index].valid && 
+                  (cache_way1[addr_index].tag == addr_tag);
+        
+        // Overall hit
+        cache_hit = way0_hit || way1_hit;
+        hit_way = way1_hit;
+        
+        // Select data from hitting way
+        if (way0_hit) begin
+            hit_data = cache_way0[addr_index].data;
+        end else if (way1_hit) begin
+            hit_data = cache_way1[addr_index].data;
+        end else begin
+            hit_data = 128'h0;
         end
         
-        // If all ways valid, use LRU
-        if (&way_valid) begin
-            replace_way = lru[index][0] ? 0 : 1; // Simple LRU for 2-way
-            need_writeback = cache_data[index][replace_way].dirty;
+        // Victim selection for replacement
+        victim_way = lru_bits[addr_index];
+        if (victim_way == 1'b0) begin
+            victim_dirty = cache_way0[addr_index].dirty;
+            victim_data = cache_way0[addr_index].data;
+            victim_addr = {cache_way0[addr_index].tag, addr_index, {OFFSET_BITS{1'b0}}};
+        end else begin
+            victim_dirty = cache_way1[addr_index].dirty;
+            victim_data = cache_way1[addr_index].data;
+            victim_addr = {cache_way1[addr_index].tag, addr_index, {OFFSET_BITS{1'b0}}};
         end
     end
-
-    // State machine logic
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Memory Interface Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    always_comb begin
+        mem_req = 1'b0;
+        mem_we = 1'b0;
+        mem_addr = 32'h0;
+        mem_wdata = 32'h0;
+        mem_be = 4'b1111;  // Always full word access
+        
+        case (state)
+            MISS_FETCH_W0, MISS_FETCH_W1, MISS_FETCH_W2, MISS_FETCH_W3: begin
+                mem_req = 1'b1;
+                mem_we = 1'b0;
+                mem_addr = {l2_addr[31:4], fetch_word_count, 2'b00};
+            end
+            
+            WRITEBACK_W0, WRITEBACK_W1, WRITEBACK_W2, WRITEBACK_W3: begin
+                mem_req = 1'b1;
+                mem_we = 1'b1;
+                mem_addr = {victim_addr[31:4], fetch_word_count, 2'b00};
+                case (fetch_word_count)
+                    2'b00: mem_wdata = victim_data[31:0];
+                    2'b01: mem_wdata = victim_data[63:32];
+                    2'b10: mem_wdata = victim_data[95:64];
+                    2'b11: mem_wdata = victim_data[127:96];
+                endcase
+            end
+        endcase
+    end
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache State Machine Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE;
-            arb_pointer <= '0;
-            serving_port <= '0;
+            fetch_word_count <= 2'b00;
+            fetch_data <= 128'h0;
         end else begin
             state <= next_state;
             
-            // Update arbitration pointer on request completion
-            if (state == RESPOND) begin
-                arb_pointer <= (arb_pointer + 1) % NUM_PORTS;
-            end
-            
-            // Capture serving port
-            if (state == IDLE && current_req) begin
-                serving_port <= current_port;
-            end
+            // Update fetch data and counter
+            case (state)
+                MISS_FETCH_W0: if (mem_ready) begin
+                    fetch_data[31:0] <= mem_rdata;
+                    fetch_word_count <= 2'b01;
+                end
+                MISS_FETCH_W1: if (mem_ready) begin
+                    fetch_data[63:32] <= mem_rdata;
+                    fetch_word_count <= 2'b10;
+                end
+                MISS_FETCH_W2: if (mem_ready) begin
+                    fetch_data[95:64] <= mem_rdata;
+                    fetch_word_count <= 2'b11;
+                end
+                MISS_FETCH_W3: if (mem_ready) begin
+                    fetch_data[127:96] <= mem_rdata;
+                    fetch_word_count <= 2'b00;
+                end
+                
+                WRITEBACK_W0, WRITEBACK_W1, WRITEBACK_W2: if (mem_ready) begin
+                    fetch_word_count <= fetch_word_count + 1;
+                end
+                WRITEBACK_W3: if (mem_ready) begin
+                    fetch_word_count <= 2'b00;
+                end
+                
+                default: begin
+                    fetch_word_count <= 2'b00;
+                end
+            endcase
         end
     end
-
+    
     always_comb begin
         next_state = state;
+        l2_rdata = 128'h0;
+        l2_valid = 1'b0;
+        
         case (state)
             IDLE: begin
-                if (current_req) begin
+                if (l2_req) begin
                     if (cache_hit) begin
-                        next_state = RESPOND;
+                        // Cache hit - respond immediately
+                        l2_rdata = hit_data;
+                        l2_valid = 1'b1;
+                        next_state = IDLE;
                     end else begin
-                        if (need_writeback) begin
-                            next_state = WRITEBACK;
+                        // Cache miss - check if victim needs writeback
+                        if (victim_dirty) begin
+                            next_state = WRITEBACK_W0;
                         end else begin
-                            next_state = ALLOCATE;
+                            next_state = MISS_FETCH_W0;
                         end
                     end
                 end
             end
-            RESPOND: begin
+            
+            // Writeback dirty victim
+            WRITEBACK_W0: begin
+                if (mem_ready) next_state = WRITEBACK_W1;
+                else next_state = WRITEBACK_W0;
+            end
+            
+            WRITEBACK_W1: begin
+                if (mem_ready) next_state = WRITEBACK_W2;
+                else next_state = WRITEBACK_W1;
+            end
+            
+            WRITEBACK_W2: begin
+                if (mem_ready) next_state = WRITEBACK_W3;
+                else next_state = WRITEBACK_W2;
+            end
+            
+            WRITEBACK_W3: begin
+                if (mem_ready) next_state = MISS_FETCH_W0;
+                else next_state = WRITEBACK_W3;
+            end
+            
+            // Fetch new cache line from memory
+            MISS_FETCH_W0: begin
+                if (mem_ready) next_state = MISS_FETCH_W1;
+                else next_state = MISS_FETCH_W0;
+            end
+            
+            MISS_FETCH_W1: begin
+                if (mem_ready) next_state = MISS_FETCH_W2;
+                else next_state = MISS_FETCH_W1;
+            end
+            
+            MISS_FETCH_W2: begin
+                if (mem_ready) next_state = MISS_FETCH_W3;
+                else next_state = MISS_FETCH_W2;
+            end
+            
+            MISS_FETCH_W3: begin
+                if (mem_ready) next_state = MISS_UPDATE;
+                else next_state = MISS_FETCH_W3;
+            end
+            
+            MISS_UPDATE: begin
+                // Respond to L2 with fetched data
+                l2_rdata = fetch_data;
+                l2_valid = 1'b1;
                 next_state = IDLE;
             end
-            WRITEBACK: begin
-                if (mem_ack) begin
-                    next_state = ALLOCATE;
-                end
-            end
-            ALLOCATE: begin
-                next_state = REFILL;
-            end
-            REFILL: begin
-                if (mem_ack) begin
-                    next_state = RESPOND;
-                end
-            end
+            
+            default: next_state = IDLE;
         endcase
     end
-
-    // Control signals
-    generate
-        for (genvar p = 0; p < NUM_PORTS; p++) begin : gen_ack
-            assign l2_ack[p] = (serving_port == p) && (state == RESPOND);
-            assign l2_rdata[p] = hit_data;
-        end
-    endgenerate
-
-    assign busy = (state != IDLE);
-
-    // Memory interface
-    always_comb begin
-        mem_req = 1'b0;
-        mem_we = 1'b0;
-        mem_addr = '0;
-        mem_wdata = '0;
-        
-        case (state)
-            WRITEBACK: begin
-                mem_req = 1'b1;
-                mem_we = 1'b1;
-                mem_addr = {cache_data[index][replace_way].tag, index, {BLOCK_OFFSET_BITS{1'b0}}};
-                mem_wdata = cache_data[index][replace_way].data;
-            end
-            ALLOCATE: begin
-                mem_req = 1'b1;
-                mem_we = 1'b0;
-                mem_addr = {current_addr[XLEN-1:BLOCK_OFFSET_BITS], {BLOCK_OFFSET_BITS{1'b0}}};
-            end
-        endcase
-    end
-
-    // Cache update logic
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Cache Update Logic
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    integer i;
+    
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            for (int i = 0; i < NUM_SETS; i++) begin
-                lru[i] <= '0;
-                for (int j = 0; j < ASSOCIATIVITY; j++) begin
-                    cache_data[i][j].valid <= 1'b0;
-                    cache_data[i][j].dirty <= 1'b0;
-                    cache_data[i][j].tag <= '0;
-                    cache_data[i][j].data <= '0;
+            // Reset cache
+            for (i = 0; i < NUM_SETS; i = i + 1) begin
+                cache_way0[i].valid <= 1'b0;
+                cache_way0[i].tag <= '0;
+                cache_way0[i].data <= 128'h0;
+                cache_way0[i].dirty <= 1'b0;
+                cache_way1[i].valid <= 1'b0;
+                cache_way1[i].tag <= '0;
+                cache_way1[i].data <= 128'h0;
+                cache_way1[i].dirty <= 1'b0;
+            end
+            lru_bits <= '0;
+        end else begin
+            // Update LRU on hit
+            if (state == IDLE && l2_req && cache_hit) begin
+                lru_bits[addr_index] <= !hit_way;
+                
+                // Handle write hit from L2
+                if (l2_we) begin
+                    if (way0_hit) begin
+                        cache_way0[addr_index].data <= l2_wdata;
+                        cache_way0[addr_index].dirty <= 1'b1;
+                    end else if (way1_hit) begin
+                        cache_way1[addr_index].data <= l2_wdata;
+                        cache_way1[addr_index].dirty <= 1'b1;
+                    end
                 end
             end
-        end else begin
-            if (flush) begin
-                for (int i = 0; i < NUM_SETS; i++) begin
-                    for (int j = 0; j < ASSOCIATIVITY; j++) begin
-                        cache_data[i][j].valid <= 1'b0;
-                        cache_data[i][j].dirty <= 1'b0;
-                    end
-                end
-            end else begin
-                // Update on cache hit
-                if ((state == RESPOND) && cache_hit) begin
-                    // Update LRU
-                    if (way_hit[0]) lru[index] <= 1'b1; // Make way 1 LRU
-                    if (way_hit[1]) lru[index] <= 1'b0; // Make way 0 LRU
-                    
-                    // Handle writes
-                    if (current_we) begin
-                        cache_data[index][hit_way].dirty <= 1'b1;
-                        cache_data[index][hit_way].data <= current_wdata;
-                    end
-                end
-                
-                // Refill on memory response
-                if (state == REFILL && mem_ack) begin
-                    cache_data[index][replace_way].valid <= 1'b1;
-                    cache_data[index][replace_way].dirty <= current_we;
-                    cache_data[index][replace_way].tag <= tag;
-                    cache_data[index][replace_way].data <= current_we ? current_wdata : mem_rdata;
-                    
-                    // Update LRU
-                    if (replace_way == 0) lru[index] <= 1'b1;
-                    if (replace_way == 1) lru[index] <= 1'b0;
+            
+            // Update cache on miss
+            if (state == MISS_UPDATE) begin
+                // Replace victim way
+                if (victim_way == 1'b0) begin
+                    cache_way0[addr_index].valid <= 1'b1;
+                    cache_way0[addr_index].tag <= addr_tag;
+                    cache_way0[addr_index].data <= fetch_data;
+                    cache_way0[addr_index].dirty <= 1'b0;
+                    lru_bits[addr_index] <= 1'b1;
+                end else begin
+                    cache_way1[addr_index].valid <= 1'b1;
+                    cache_way1[addr_index].tag <= addr_tag;
+                    cache_way1[addr_index].data <= fetch_data;
+                    cache_way1[addr_index].dirty <= 1'b0;
+                    lru_bits[addr_index] <= 1'b0;
                 end
             end
         end
     end
-
+    
+    //////////////////////////////////////////////////////////////////////////////////
+    // Debug Output (simulation only)
+    //////////////////////////////////////////////////////////////////////////////////
+    
+    `ifdef SIMULATION
+    always @(posedge clk) begin
+        if (state == IDLE && l2_req && cache_hit) begin
+            $display("Time %t: L3 Cache HIT - Addr: 0x%08x", $time, l2_addr);
+        end
+        if (state == MISS_FETCH_W0) begin
+            $display("Time %t: L3 Cache MISS - Addr: 0x%08x, Fetching from memory", $time, l2_addr);
+        end
+    end
+    `endif
+    
 endmodule

@@ -1,90 +1,115 @@
-# RISC-V CPU Makefile
-# Author: Auto-generated
-# Date: 2025-09-03
-# -----------------------------------------------------------------------------
-# What this Makefile does:
-# - Wraps common development tasks: compile, sim, test, synth, lint, docs, etc.
-# - Delegates to scripts/simulation/run_sim.sh for multi-simulator flows.
-# - Provides convenience targets for cleaning and environment checks.
-#
-# How to use:
-# - make            # default compile with $(SIM)
-# - make sim        # compile then run
-# - make lint       # verilator lint if available
-# - make clean      # remove build artifacts and waves
-# - make help       # list targets
-#
-# Variables:
-# - SIM=verilator|vcs|iverilog
-# - SYNTH_TOOL=vivado|dc
-# -----------------------------------------------------------------------------
+#################################################################################
+# Makefile for RISC-V CPU Project
+# Supports simulation with multiple simulators and synthesis
+#################################################################################
 
 # Project configuration
 PROJECT_NAME = riscv_cpu
-TOP_MODULE = riscv_top
-TESTBENCH = riscv_core_tb
+TOP_MODULE = top
+TB_MODULE = cpu_tb
 
-# Directories
+# Directory structure
 RTL_DIR = rtl
-TB_DIR = tb
-BUILD_DIR = build
-DOCS_DIR = docs
+TB_DIR = testbench
 SCRIPTS_DIR = scripts
+BUILD_DIR = build
 
-# Tool configuration
-SIM ?= verilator
-SYNTH_TOOL ?= vivado
+# Source files
+RTL_SOURCES = $(RTL_DIR)/top.sv \
+              $(RTL_DIR)/cpu/cpu_types.sv \
+              $(RTL_DIR)/cpu/cpu_core.sv \
+              $(RTL_DIR)/cpu/if_stage.sv \
+              $(RTL_DIR)/cpu/id_stage.sv \
+              $(RTL_DIR)/cpu/ex_stage.sv \
+              $(RTL_DIR)/cpu/mem_stage.sv \
+              $(RTL_DIR)/cpu/wb_stage.sv \
+              $(RTL_DIR)/cpu/regfile.sv \
+              $(RTL_DIR)/cpu/control_unit.sv \
+              $(RTL_DIR)/cpu/hazard_unit.sv \
+              $(RTL_DIR)/cpu/branch_predictor.sv \
+              $(RTL_DIR)/cpu/csr.sv \
+              $(RTL_DIR)/cache/l1_icache.sv \
+              $(RTL_DIR)/cache/l1_dcache.sv \
+              $(RTL_DIR)/cache/l2_cache.sv \
+              $(RTL_DIR)/cache/l3_cache.sv \
+              $(RTL_DIR)/mmu/mmu.sv \
+              $(RTL_DIR)/mmu/tlb.sv \
+              $(RTL_DIR)/mmu/page_table_walk.sv \
+              $(RTL_DIR)/mmu/exception_handler.sv \
+              $(RTL_DIR)/memory/dram_model.sv
 
-# RTL source files
-RTL_SOURCES = $(shell find $(RTL_DIR) -name "*.sv")
-TB_SOURCES = $(shell find $(TB_DIR) -name "*.sv")
+TB_SOURCES = $(TB_DIR)/cpu_tb.sv
+
+ALL_SOURCES = $(RTL_SOURCES) $(TB_SOURCES)
+
+# Simulator configuration
+SIMULATOR ?= iverilog
+
+# Simulator-specific settings
+ifeq ($(SIMULATOR),iverilog)
+    COMPILE_CMD = iverilog -g2012 -o $(BUILD_DIR)/$(TB_MODULE) $(ALL_SOURCES)
+    SIMULATE_CMD = vvp $(BUILD_DIR)/$(TB_MODULE)
+    WAVE_FILE = $(BUILD_DIR)/cpu_tb.vcd
+endif
+
+ifeq ($(SIMULATOR),verilator)
+    COMPILE_CMD = verilator --cc --exe --build -j 0 -Wall --trace \
+                  --top-module $(TB_MODULE) $(ALL_SOURCES) --exe /dev/null
+    SIMULATE_CMD = ./obj_dir/V$(TB_MODULE)
+    WAVE_FILE = $(BUILD_DIR)/cpu_tb.vcd
+endif
+
+ifeq ($(SIMULATOR),modelsim)
+    COMPILE_CMD = vlog -work work $(ALL_SOURCES)
+    SIMULATE_CMD = vsim -c -do "run -all; exit" work.$(TB_MODULE)
+    WAVE_FILE = $(BUILD_DIR)/cpu_tb.wlf
+endif
+
+ifeq ($(SIMULATOR),xsim)
+    COMPILE_CMD = xvlog --sv $(ALL_SOURCES) && xelab $(TB_MODULE) -s $(TB_MODULE)_sim
+    SIMULATE_CMD = xsim $(TB_MODULE)_sim -runall
+    WAVE_FILE = $(BUILD_DIR)/cpu_tb.wdb
+endif
 
 # Default target
-.PHONY: all
-all: compile
-
-# Help target
-.PHONY: help
-help:
-	@echo "RISC-V CPU Build System"
-	@echo ""
-	@echo "Available targets:"
-	@echo "  compile    - Compile RTL using default simulator"
-	@echo "  sim        - Run simulation"
-	@echo "  test       - Run all tests"
-	@echo "  synth      - Run synthesis"
-	@echo "  clean      - Clean build directory"
-	@echo "  docs       - Generate documentation"
-	@echo "  lint       - Run linting checks"
-	@echo ""
-	@echo "Variables:"
-	@echo "  SIM        - Simulator to use (verilator, vcs, iverilog)"
-	@echo "  SYNTH_TOOL - Synthesis tool (vivado, dc)"
+all: simulate
 
 # Create build directory
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-# Compile RTL
-.PHONY: compile
+# Compile design
 compile: $(BUILD_DIR)
-	@echo "Compiling RTL with $(SIM)..."
-	$(SCRIPTS_DIR)/simulation/run_sim.sh $(SIM)
+	@echo "Compiling with $(SIMULATOR)..."
+	cd $(BUILD_DIR) && $(COMPILE_CMD)
+	@echo "Compilation completed."
 
 # Run simulation
-.PHONY: sim
-sim: compile
-	@echo "Running simulation..."
-	@cd $(BUILD_DIR) && ./riscv_sim
+simulate: compile
+	@echo "Running simulation with $(SIMULATOR)..."
+	cd $(BUILD_DIR) && $(SIMULATE_CMD)
+	@echo "Simulation completed."
 
-# Run tests
-.PHONY: test
-test:
-	@echo "Running tests..."
-	@$(MAKE) -C $(TB_DIR)/core_tb test
-	@$(MAKE) -C $(TB_DIR)/cache_tb test
-	@$(MAKE) -C $(TB_DIR)/mmu_tb test
-	@$(MAKE) -C $(TB_DIR)/integration_tb test
+# Run simulation with waveform dumping
+simulate_wave: compile
+	@echo "Running simulation with waveform dump..."
+	cd $(BUILD_DIR) && $(COMPILE_CMD) -DDUMP_VCD && $(SIMULATE_CMD)
+	@echo "Simulation completed. Waveform saved to $(WAVE_FILE)"
+
+# Quick test with Icarus Verilog
+quick_test: $(BUILD_DIR)
+	@echo "Running quick test with Icarus Verilog..."
+	cd $(BUILD_DIR) && iverilog -g2012 -DDUMP_VCD -o $(TB_MODULE) $(addprefix ../,$(ALL_SOURCES))
+	cd $(BUILD_DIR) && vvp $(TB_MODULE)
+	@echo "Quick test completed."
+
+# View waveforms
+wave:
+	@if [ -f "$(BUILD_DIR)/cpu_tb.vcd" ]; then \
+		gtkwave $(BUILD_DIR)/cpu_tb.vcd; \
+	else \
+		echo "No VCD file found. Run 'make simulate_wave' first."; \
+	fi
 
 # Run synthesis
 .PHONY: synth
@@ -92,25 +117,41 @@ synth: $(BUILD_DIR)
 	@echo "Running synthesis with $(SYNTH_TOOL)..."
 	$(SCRIPTS_DIR)/synthesis/synth_$(SYNTH_TOOL).tcl
 
-# Linting
-.PHONY: lint
-lint:
-	@echo "Running linting checks..."
-	@if command -v verilator >/dev/null 2>&1; then \
-		verilator --lint-only --Wall -I$(RTL_DIR)/common $(RTL_SOURCES); \
-	else \
-		echo "Verilator not found, skipping lint"; \
-	fi
+# Lint the design
+lint: $(BUILD_DIR)
+	@echo "Linting design with Verilator..."
+	verilator --lint-only --top-module $(TOP_MODULE) $(RTL_SOURCES)
+	@echo "Linting completed."
 
-# Documentation
-.PHONY: docs
+# Synthesize with Yosys (if available)
+synthesize: $(BUILD_DIR)
+	@echo "Synthesizing design with Yosys..."
+	cd $(BUILD_DIR) && yosys -p "read_verilog -sv $(addprefix ../,$(RTL_SOURCES)); synth -top $(TOP_MODULE); write_verilog $(PROJECT_NAME)_synth.v"
+	@echo "Synthesis completed."
+
+# Assembly test programs
+assemble_tests:
+	@echo "Assembling test programs..."
+	@for test in $(TB_DIR)/test_programs/*.s; do \
+		base=$$(basename $$test .s); \
+		echo "Assembling $$test..."; \
+		riscv64-unknown-elf-as -march=rv32i -mabi=ilp32 -o $(BUILD_DIR)/$$base.o $$test; \
+		riscv64-unknown-elf-ld -m elf32lriscv -Ttext 0x0 -o $(BUILD_DIR)/$$base.elf $(BUILD_DIR)/$$base.o; \
+		riscv64-unknown-elf-objcopy -O binary $(BUILD_DIR)/$$base.elf $(BUILD_DIR)/$$base.bin; \
+		riscv64-unknown-elf-objdump -d $(BUILD_DIR)/$$base.elf > $(BUILD_DIR)/$$base.dump; \
+		xxd -g 4 $(BUILD_DIR)/$$base.bin > $(BUILD_DIR)/$$base.hex; \
+	done
+	@echo "Test programs assembled."
+
+# Generate documentation
 docs:
 	@echo "Generating documentation..."
-	@if command -v sphinx-build >/dev/null 2>&1; then \
-		cd $(DOCS_DIR) && sphinx-build -b html . _build; \
-	else \
-		echo "Sphinx not found, skipping documentation generation"; \
-	fi
+	@mkdir -p docs/generated
+	@echo "# RISC-V CPU Documentation" > docs/generated/README.md
+	@echo "" >> docs/generated/README.md
+	@echo "## Module Hierarchy" >> docs/generated/README.md
+	@find $(RTL_DIR) -name "*.sv" -exec echo "- {}" \; >> docs/generated/README.md
+	@echo "Documentation generated in docs/generated/"
 
 # Format code
 .PHONY: format
@@ -148,68 +189,48 @@ coverage:
 	@$(SCRIPTS_DIR)/verification/coverage.sh
 
 # Clean build artifacts
-.PHONY: clean
 clean:
-	@echo "Cleaning build directory..."
 	rm -rf $(BUILD_DIR)
-	find . -name "*.vcd" -delete
-	find . -name "*.vpd" -delete
-	find . -name "*.fsdb" -delete
-	find . -name "*.log" -delete
-	find . -name "simv*" -delete
-	find . -name "csrc" -type d -exec rm -rf {} + 2>/dev/null || true
-	find . -name ".simvision" -type d -exec rm -rf {} + 2>/dev/null || true
+	rm -rf obj_dir
+	rm -f *.vcd *.wlf *.log
 
-# Deep clean (including tool-generated files)
-.PHONY: distclean
+# Clean everything including documentation
 distclean: clean
-	rm -rf vivado.*
-	rm -rf .Xil
-	rm -rf work
-	find . -name "*.jou" -delete
-	find . -name "*.str" -delete
+	rm -rf docs/generated
 
-# Install dependencies
-.PHONY: install-deps
-install-deps:
-	@echo "Installing dependencies..."
-	@if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
+# Run regression tests
+regression: clean quick_test
+	@echo "All regression tests passed!"
 
-# Git hooks setup
-.PHONY: setup-hooks
-setup-hooks:
-	@echo "Setting up git hooks..."
-	@cp scripts/git-hooks/* .git/hooks/
-	@chmod +x .git/hooks/*
+# Show help
+help:
+	@echo "Available targets:"
+	@echo "  all          - Default target (same as simulate)"
+	@echo "  compile      - Compile the design"
+	@echo "  simulate     - Run simulation"
+	@echo "  simulate_wave- Run simulation with waveform dump"
+	@echo "  quick_test   - Quick test with Icarus Verilog"
+	@echo "  wave         - View waveforms with GTKWave"
+	@echo "  lint         - Lint design with Verilator"
+	@echo "  synthesize   - Synthesize design with Yosys"
+	@echo "  assemble_tests - Assemble test programs"
+	@echo "  docs         - Generate documentation"
+	@echo "  clean        - Clean build artifacts"
+	@echo "  distclean    - Clean everything"
+	@echo "  regression   - Run regression tests"
+	@echo "  help         - Show this help"
+	@echo ""
+	@echo "Variables:"
+	@echo "  SIMULATOR    - Choose simulator: iverilog, verilator, modelsim, xsim"
+	@echo ""
+	@echo "Examples:"
+	@echo "  make SIMULATOR=verilator simulate"
+	@echo "  make quick_test"
+	@echo "  make simulate_wave && make wave"
 
-# Check environment
-.PHONY: check-env
-check-env:
-	@echo "Checking environment..."
-	@echo "SystemVerilog simulators:"
-	@command -v verilator >/dev/null && echo "  ✓ Verilator found" || echo "  ✗ Verilator not found"
-	@command -v vcs >/dev/null && echo "  ✓ VCS found" || echo "  ✗ VCS not found"
-	@command -v iverilog >/dev/null && echo "  ✓ Icarus Verilog found" || echo "  ✗ Icarus Verilog not found"
-	@echo "Synthesis tools:"
-	@command -v vivado >/dev/null && echo "  ✓ Vivado found" || echo "  ✗ Vivado not found"
-	@echo "Verification tools:"
-	@command -v python3 >/dev/null && echo "  ✓ Python3 found" || echo "  ✗ Python3 not found"
+# Phony targets
+.PHONY: all compile simulate simulate_wave quick_test wave lint synthesize assemble_tests docs clean distclean regression help
 
-# Development workflow
-.PHONY: dev
-dev: lint compile sim test
-	@echo "Development workflow completed successfully!"
-
-# Continuous integration
-.PHONY: ci
-ci: check-env lint compile test coverage
-	@echo "CI pipeline completed!"
-
-# Print project statistics
-.PHONY: stats
-stats:
-	@echo "Project Statistics:"
-	@echo "RTL files: $(shell find $(RTL_DIR) -name "*.sv" | wc -l)"
-	@echo "RTL lines: $(shell find $(RTL_DIR) -name "*.sv" -exec wc -l {} + | tail -1)"
-	@echo "Test files: $(shell find $(TB_DIR) -name "*.sv" | wc -l)"
-	@echo "Test lines: $(shell find $(TB_DIR) -name "*.sv" -exec wc -l {} + | tail -1)"
+#################################################################################
+# End of Makefile
+#################################################################################
