@@ -1,0 +1,17 @@
+# vlog -sv unit_tests/regfile_tb.sv ../rtl/cpu/regfile.sv
+# Questa Intel Starter FPGA Edition-64 vlog 2021.2 Compiler 2021.04 Apr 14 2021
+# Start time: 22:03:34 on Oct 08,2025
+# vlog -sv unit_tests/regfile_tb.sv ../rtl/cpu/regfile.sv 
+# ** Error: (vlog-7) Failed to open design unit file "unit_tests/regfile_tb.sv" in read mode.
+# No such file or directory. (errno = ENOENT)
+# End time: 22:03:34 on Oct 08,2025, Elapsed time: 0:00:00
+# Errors: 1, Warnings: 0
+# /opt/intelFPGA_pro/21.1/questa_fse/linux_x86_64/vlog failed.
+#  vsim -c regfile_tb -do 'run -all
+# ** UI-Msg: (vish-3296) Unknown option '-all'.
+# Use the -help option for complete vsim usage.
+# Error loading design
+#  quit -f'
+# unknown switch: -f'
+# 
+# <EOF>

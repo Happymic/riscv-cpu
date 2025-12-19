@@ -1,0 +1,29 @@
+# vsim -c simple_cache_test -do "run 500ns; quit" 
+# Start time: 22:04:15 on Oct 08,2025
+# ** Note: (vsim-3812) Design is being optimized...
+# //  Questa Intel Starter FPGA Edition-64
+# //  Version 2021.2 linux_x86_64 Apr 14 2021
+# //
+# //  Copyright 1991-2021 Mentor Graphics Corporation
+# //  All Rights Reserved.
+# //
+# //  QuestaSim and its associated documentation contain trade
+# //  secrets and commercial or financial information that are the property of
+# //  Mentor Graphics Corporation and are privileged, confidential,
+# //  and exempt from disclosure under the Freedom of Information Act,
+# //  5 U.S.C. Section 552. Furthermore, this information
+# //  is prohibited from disclosure under the Trade Secrets Act,
+# //  18 U.S.C. Section 1905.
+# //
+# Loading sv_std.std
+# Loading work.simple_cache_test(fast)
+# run 500ns
+# === Simple Cache Test Started ===
+# Test 1 - Read addr=0x00001000, data=0x00000000, hit=0
+# Test 2 - Write addr=0x00001004, data=0xdeadbeef, hit=1
+# Test 3 - Read back addr=0x00001004, data=0x00001000, hit=1
+# === Simple Cache Test Completed ===
+# ** Note: $finish    : simple_test.sv(138)
+#    Time: 325 ns  Iteration: 0  Instance: /simple_cache_test
+# End time: 22:04:16 on Oct 08,2025, Elapsed time: 0:00:01
+# Errors: 0, Warnings: 0
